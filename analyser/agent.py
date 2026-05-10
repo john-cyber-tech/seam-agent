@@ -2,7 +2,7 @@
 agent.py — AI migration planner powered by Claude.
 
 Reads the JSON report produced by the analysis pipeline and streams a structured
-four-section migration plan using claude-opus-4-7.
+five-section migration plan using claude-opus-4-7.
 
 Prompt-caching strategy
 -----------------------
@@ -38,7 +38,15 @@ You will receive a knowledge-graph analysis report produced by a static-analysis
 tool that parsed a Java codebase, built a dependency graph, and ran Louvain \
 community detection. Each community is a candidate microservice boundary.
 
-Produce a structured migration plan with exactly these four sections:
+Produce a structured migration plan with exactly these five sections:
+
+## 0. Codebase Overview
+A single paragraph (4–6 sentences) written for a reader who has never seen this \
+codebase. Describe what the application does as a product, then explain how it is \
+architected at a high level: the main functional domains, how they relate to each \
+other, and what data the system manages. Do not mention communities, clusters, or \
+graph metrics — write this as a plain architectural summary derived from the class \
+names and dependencies in the report.
 
 ## 1. Proposed Microservices
 For each detected community list:
