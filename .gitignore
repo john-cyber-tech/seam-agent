@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+*.egg-info/
+
+# Generated analysis outputs
+graph.html
+report.json
+
+# Generated migration plans
+*migration_plan*.md
+
+# Claude Code internal state
+memory/
