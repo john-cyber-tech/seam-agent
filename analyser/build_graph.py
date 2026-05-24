@@ -1,12 +1,3 @@
-"""
-build_graph.py — Knowledge-graph construction and analysis.
-
-Responsibilities:
-  - Build a directed NetworkX graph from raw dependency edges.
-  - Run Louvain community detection to surface natural service boundaries.
-  - Compute per-node coupling metrics used for migration risk scoring.
-  - Identify cross-cluster edges — the future API surface of a microservices split.
-"""
 
 import networkx as nx
 import community as community_louvain
@@ -14,14 +5,7 @@ from collections import defaultdict
 
 
 def build_graph(edges: list[dict], classes: list[dict]) -> nx.DiGraph:
-    """
-    Construct a directed dependency graph from parsed Java edges.
-
-    Nodes are added for every known class (with domain/package metadata) and for
-    every DB table referenced in SQL strings.  Edges are deduplicated by the
-    (source, target, relationship) triple — a class can both `import` and
-    `instantiate` another, so the relationship is part of the key.
-    """
+    """Edge key includes relationship — a class can both import and instantiate the same target."""
     G = nx.DiGraph()
     class_meta = {c["name"]: c for c in classes}
 
@@ -50,41 +34,19 @@ def build_graph(edges: list[dict], classes: list[dict]) -> nx.DiGraph:
 
 
 def run_clustering(G: nx.DiGraph) -> dict[str, int]:
-    """
-    Detect communities using the Louvain algorithm.
-
-    Returns a mapping of node name → community id.
-
-    Two preparation steps before clustering:
-      - Project to undirected: Louvain operates on undirected graphs; direction
-        matters for metrics but not for cohesion grouping.
-      - Remove isolates: nodes with no edges have no community signal and cause
-        python-louvain to raise an error.
-
-    Only project-class nodes with a known domain are clustered; DB table nodes
-    and unknown/stdlib nodes are excluded so they do not distort boundaries.
-    """
     U = G.to_undirected()
+    # exclude DB tables and stdlib nodes; they'd blur service boundaries
     project_nodes = [
         n for n in U.nodes()
         if G.nodes[n].get("node_type") == "class"
         and G.nodes[n].get("domain") not in ("unknown", "")
     ]
     U_filtered = U.subgraph(project_nodes).copy()
-    U_filtered.remove_nodes_from(list(nx.isolates(U_filtered)))
+    U_filtered.remove_nodes_from(list(nx.isolates(U_filtered)))  # python-louvain errors on isolates
     return community_louvain.best_partition(U_filtered)
 
 
 def compute_metrics(G: nx.DiGraph) -> dict:
-    """
-    Compute three coupling metrics for every class node:
-
-      betweenness — normalised betweenness centrality.  High values indicate
-                    bridge classes that sit on many shortest paths; extracting
-                    them early in a migration is high-risk.
-      in_degree   — number of classes that depend on this one (fanin).
-      out_degree  — number of classes this one depends on (fanout).
-    """
     try:
         betweenness = nx.betweenness_centrality(G, normalized=True)
     except Exception:
@@ -106,13 +68,6 @@ def compute_metrics(G: nx.DiGraph) -> dict:
 
 
 def cross_cluster_edges(G: nx.DiGraph, partition: dict[str, int]) -> list[dict]:
-    """
-    Return all edges whose endpoints belong to different communities.
-
-    These are the coupling points that must become explicit contracts
-    (REST calls, async events, or shared libraries) in a microservices world.
-    The Claude agent classifies each one in its migration plan.
-    """
     return [
         {
             "from": src, "to": dst,

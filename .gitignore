@@ -17,5 +17,8 @@ report.json
 # Generated migration plans
 *migration_plan*.md
 
+# Environment variables (never commit secrets)
+.env
+
 # Claude Code internal state
 memory/

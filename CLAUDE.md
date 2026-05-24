@@ -32,25 +32,12 @@ The analyser and the monolith can live anywhere on your machine. The expected st
 
 ## How to run
 
-### Batch mode (original behaviour)
-
-Navigate to the `analyser/` folder and pass the path to any Java repo:
+### Live mode (default — real-time browser visualisation + agent)
 
 ```bash
 cd analyser
-python main.py ../java-monolith
-```
-
-Outputs are written alongside the repo being analysed:
-- `<repo>/graph.html` — interactive dependency graph, open in any browser
-- `<repo>/report.json` — structured JSON with communities, metrics, cross-cluster edges, and migration order
-
-### Live mode (real-time browser visualisation + agent)
-
-```bash
-cd analyser
-python main.py --live                    # no path — enter it in the browser
-python main.py ../java-monolith --live   # pre-fills the folder field
+python main.py                           # no path — enter it in the browser
+python main.py ../java-monolith          # pre-fills the folder field
 ```
 
 Opens a browser at `http://localhost:5050` showing a **setup page** with two fields:
@@ -59,6 +46,17 @@ Opens a browser at `http://localhost:5050` showing a **setup page** with two fie
 - **Anthropic API key** — optional password field. Held in memory for the duration of the run only; never written to disk, logs, or any HTTP response body. If left blank the agent falls back to the `ANTHROPIC_API_KEY` environment variable.
 
 Clicking **Start Analysis** (or pressing Enter) validates the inputs, then redirects to `/graph` where the live visualisation begins: the graph builds file-by-file, communities are coloured one-by-one, node sizes update with coupling weight, cross-cluster edges are highlighted in red, and the Claude agent streams its migration plan into the right-hand panel. The same output files are written at the end.
+
+### Batch mode (headless, no browser)
+
+```bash
+cd analyser
+python main.py ../java-monolith --batch
+```
+
+Outputs are written alongside the repo being analysed:
+- `<repo>/graph.html` — interactive dependency graph, open in any browser
+- `<repo>/report.json` — structured JSON with communities, metrics, cross-cluster edges, and migration order
 
 ### Agent only (run against an existing report)
 
@@ -120,7 +118,8 @@ The Anthropic API key can be supplied in two ways (in order of precedence):
    - Diamond shape = DB table node
    - Red edges = table access; grey = class dependency
 
-8. **Agent** (`agent.py`) — calls `claude-opus-4-7` with streaming. Prompt caching is applied to the system prompt and static context block. Produces four sections:
+8. **Agent** (`agent.py`) — calls `claude-opus-4-7` with streaming. Prompt caching is applied to the system prompt and static context block. Produces five sections:
+   - Codebase overview (plain-language architectural summary)
    - Named microservices (one per community) with extraction difficulty rating
    - Strangler-fig migration plan (ordered steps with rationale)
    - Cross-cluster edge classification: REST API / async event / shared library

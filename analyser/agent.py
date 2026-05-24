@@ -1,35 +1,26 @@
-"""
-agent.py — AI migration planner powered by Claude.
+"""System prompt and static context are ephemeral-cached; only the dynamic report JSON is billed on repeat runs (~85% cost reduction)."""
 
-Reads the JSON report produced by the analysis pipeline and streams a structured
-five-section migration plan using claude-opus-4-7.
-
-Prompt-caching strategy
------------------------
-Two cache breakpoints are set with `cache_control: ephemeral`:
-
-  1. The system prompt  — role definition and output schema.  Stable across all
-     runs; cached on the first call and reused for ~5 minutes.
-
-  2. The static context block — explanation of the analysis methodology, sent as
-     the first content block of the user turn.  Also stable; cached alongside
-     the system prompt.
-
-Only the dynamic report JSON (the third block) is billed as input tokens on
-repeat runs against the same report, reducing input cost by ~85 %.
-
-Usage:
-    python agent.py <path-to-report.json>
-"""
-
+import os
 import sys
 from pathlib import Path
 
 import anthropic
 
+
+def _load_env_file():
+    env_path = Path(__file__).resolve().parent.parent / '.env'
+    if not env_path.exists():
+        return
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        key, _, val = line.partition('=')
+        os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+
+_load_env_file()
+
 # ── System prompt ─────────────────────────────────────────────────────────────
-# Sent with cache_control so it is cached on the first request and reused for
-# all subsequent calls within the 5-minute TTL.
 _SYSTEM = """\
 You are an expert software architect specialising in monolith-to-microservices \
 migration using the strangler-fig pattern.
@@ -78,8 +69,6 @@ Be concise and precise. Use markdown formatting throughout.\
 """
 
 # ── Static context block ──────────────────────────────────────────────────────
-# Describes the analysis methodology; never changes between runs, so cached
-# as the first user-turn content block alongside the system prompt.
 _STATIC_CONTEXT = """\
 The report below was produced by static analysis of a Java monolith. \
 The tool extracted import statements, instantiation calls (new Foo()), and \
@@ -91,13 +80,7 @@ external ones — natural microservice boundaries.\
 
 
 def save_plan_interactive(plan_text: str, default_dir: str = ".") -> Path:
-    """
-    Prompt for a filename and directory, then write the migration plan as a
-    markdown file.
-
-    Falls back to defaults silently when stdin is not a TTY (e.g. when the
-    process is launched as a background task without an attached terminal).
-    """
+    """Falls back to defaults silently when stdin is not a TTY."""
     print("\n► Migration plan ready. Where would you like to save it?")
 
     try:
@@ -121,26 +104,14 @@ def save_plan_interactive(plan_text: str, default_dir: str = ".") -> Path:
 
 
 def run_agent(report_path: str, chunk_callback=None, api_key: str = None) -> str:
-    """
-    Load report.json, stream a migration plan from Claude, and return the full text.
-
-    Args:
-        report_path:    Path to the report.json file produced by the pipeline.
-        chunk_callback: Optional callable invoked with each streamed text chunk.
-                        Used by live mode to forward tokens to the browser via SSE.
-        api_key:        Anthropic API key.  If None, falls back to the
-                        ANTHROPIC_API_KEY environment variable.
-
-    Returns:
-        The complete migration plan as a markdown string.
-    """
+    """Stream a migration plan from Claude; chunk_callback receives each token as it arrives."""
     report_text = Path(report_path).read_text()
     client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
 
     full_text = ""
     with client.messages.stream(
         model="claude-opus-4-7",
-        max_tokens=4096,
+        max_tokens=8192,
         system=[{"type": "text", "text": _SYSTEM, "cache_control": {"type": "ephemeral"}}],
         messages=[
             {

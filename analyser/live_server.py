@@ -1,30 +1,18 @@
 """
-live_server.py — Flask + SSE server for real-time graph visualisation.
-
-Flow:
-  1. start() launches Flask on port 5050 and opens the browser.
-  2. The browser lands on the setup page (/) where the user picks a folder
-     and optionally enters an Anthropic API key.
-  3. POST /start validates the folder, stores the config in memory, and
-     signals the analysis to begin.
-  4. The browser navigates to /graph which streams graph events via SSE.
-
-The API key is held in a module-level variable for the duration of the run
-and is never written to disk, logs, or included in any HTTP response.
-
-Message types emitted to the frontend:
-  status              { message }
-  stage               { stage: parsing|clustering|metrics|agent|complete }
-  progress            { current, total }
-  log                 { message, highlight? }
-  add_node            { id, label, domain, node_type }
-  add_edge            { from, to, relationship }
-  cluster             { node, community }
-  metrics             { node, betweenness, in_degree, out_degree, total_degree }
+SSE message types emitted to the frontend:
+  status               { message }
+  stage                { stage: parsing|clustering|metrics|agent|complete }
+  progress             { current, total }
+  log                  { message, highlight? }
+  add_node             { id, label, domain, node_type }
+  add_edge             { from, to, relationship }
+  cluster              { node, community }
+  metrics              { node, betweenness, in_degree, out_degree, total_degree }
   highlight_cross_edge { from, to }
-  file_parsed         {}
-  agent_chunk         { text }
-  complete            { message }
+  file_parsed          {}
+  agent_chunk          { text }
+  plan_ready           { default_dir }
+  complete             { message }
 """
 
 import json
@@ -49,10 +37,9 @@ _subscribers: list[queue.Queue] = []
 _lock = threading.Lock()
 
 # ── Setup / config state ──────────────────────────────────────────────────────
-_prefill: str = ""          # CLI-supplied path to pre-fill the folder field
-_start_event = threading.Event()  # set when the user submits the setup form
+_prefill: str = ""
+_start_event = threading.Event()
 _pending_folder: str = ""
-_pending_api_key: str | None = None  # cleared from memory after retrieval
 _pending_plan: str = ""
 
 # ── Setup page ────────────────────────────────────────────────────────────────
@@ -65,137 +52,125 @@ _SETUP_HTML = """<!DOCTYPE html>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
-  background: #111; color: #e0e0e0;
+  background: #0d1f1b; color: #e0e0e0;
   font-family: 'Menlo','Monaco','Consolas',monospace;
   min-height: 100vh; display: flex; align-items: center; justify-content: center;
 }
 .wrap { width: 100%; display: flex; justify-content: center; padding: 40px 20px; }
 .card {
-  width: 480px; background: #181818; border: 1px solid #222;
+  width: 480px; background: #152e28; border: 1px solid #1e3d36;
   border-radius: 8px; padding: 40px 44px 36px;
 }
-.icon { font-size: 28px; color: #534AB7; margin-bottom: 14px; }
+.icon { font-size: 28px; color: #006B58; margin-bottom: 14px; }
 h1 { font-size: 17px; font-weight: 600; color: #fff; margin-bottom: 8px; }
-.sub { font-size: 11px; color: #555; line-height: 1.6; margin-bottom: 32px; }
+.sub { font-size: 11px; color: #888; line-height: 1.6; margin-bottom: 32px; }
 label {
   display: flex; align-items: center; gap: 8px;
-  font-size: 10px; color: #666; font-weight: 700; letter-spacing: 0.6px;
+  font-size: 10px; color: #999; font-weight: 700; letter-spacing: 0.6px;
   text-transform: uppercase; margin-bottom: 7px;
 }
 .badge {
   font-size: 9px; font-weight: 700; letter-spacing: 0.4px;
-  background: #1a2a1a; color: #3a7a3a; border: 1px solid #2a4a2a;
+  background: #253525; color: #5aa05a; border: 1px solid #406040;
   padding: 1px 6px; border-radius: 8px; text-transform: uppercase;
 }
 
 /* folder row */
 .folder-row { display: flex; gap: 8px; margin-bottom: 6px; }
 .folder-row input {
-  flex: 1; margin: 0; background: #0e0e0e; border: 1px solid #252525;
+  flex: 1; margin: 0; background: #091512; border: 1px solid #1e3d36;
   color: #e0e0e0; font-family: inherit; font-size: 12px;
   padding: 10px 12px; border-radius: 4px; outline: none;
   transition: border-color 0.2s;
 }
-.folder-row input:focus { border-color: #534AB7; }
-.folder-row input::placeholder { color: #333; }
+.folder-row input:focus { border-color: #006B58; }
+.folder-row input::placeholder { color: #666; }
 .browse-btn {
-  flex-shrink: 0; background: #1e1e1e; border: 1px solid #2a2a2a;
-  color: #888; font-family: inherit; font-size: 12px;
+  flex-shrink: 0; background: #152e28; border: 1px solid #1e3d36;
+  color: #aaa; font-family: inherit; font-size: 12px;
   padding: 0 14px; border-radius: 4px; cursor: pointer; white-space: nowrap;
   transition: background 0.15s, color 0.15s, border-color 0.15s;
 }
-.browse-btn:hover { background: #2a2a2a; color: #ccc; border-color: #3a3a3a; }
+.browse-btn:hover { background: #1a3530; color: #ddd; border-color: #555; }
 
-/* api key input */
-.apikey-input {
-  display: block; width: 100%; background: #0e0e0e;
-  border: 1px solid #252525; color: #e0e0e0;
-  font-family: inherit; font-size: 12px;
-  padding: 10px 12px; border-radius: 4px;
-  margin-bottom: 6px; outline: none; transition: border-color 0.2s;
-}
-.apikey-input:focus { border-color: #534AB7; }
-.apikey-input::placeholder { color: #333; }
-
-.hint { font-size: 10px; color: #3a3a3a; margin-bottom: 24px; line-height: 1.5; }
+.hint { font-size: 10px; color: #777; margin-bottom: 24px; line-height: 1.5; }
 .start-btn {
-  width: 100%; background: #534AB7; color: #fff; border: none;
+  width: 100%; background: #006B58; color: #fff; border: none;
   font-family: inherit; font-size: 13px; font-weight: 600;
   padding: 12px; border-radius: 4px; cursor: pointer; margin-top: 6px;
   transition: background 0.2s;
 }
-.start-btn:hover:not(:disabled) { background: #6259c9; }
-.start-btn:disabled { background: #222; color: #444; cursor: not-allowed; }
+.start-btn:hover:not(:disabled) { background: #007D68; }
+.start-btn:disabled { background: #152e28; color: #666; cursor: not-allowed; }
 .error { font-size: 11px; color: #cc4444; margin-top: 12px; min-height: 16px; line-height: 1.4; }
-.divider { border: none; border-top: 1px solid #1e1e1e; margin: 28px 0; }
 
 /* ── Folder picker modal ────────────────────────────────────────────────────── */
 .modal-overlay {
-  position: fixed; inset: 0; background: rgba(0,0,0,0.65);
+  position: fixed; inset: 0; background: rgba(0,0,0,0.5);
   display: flex; align-items: center; justify-content: center; z-index: 100;
 }
 .picker-card {
-  width: 540px; background: #181818; border: 1px solid #2a2a2a;
+  width: 540px; background: #152e28; border: 1px solid #1e3d36;
   border-radius: 7px; overflow: hidden;
   display: flex; flex-direction: column; max-height: 500px;
-  box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+  box-shadow: 0 20px 60px rgba(0,0,0,0.4);
 }
 .picker-header {
-  background: #111; border-bottom: 1px solid #222;
+  background: #0d1f1b; border-bottom: 1px solid #1e3d36;
   padding: 10px 14px; display: flex; align-items: center; gap: 4px;
   overflow-x: auto; white-space: nowrap; flex-shrink: 0; min-height: 40px;
 }
 .picker-header::-webkit-scrollbar { height: 3px; }
-.picker-header::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
-.bc-root { font-size: 11px; color: #555; cursor: pointer; padding: 2px 4px; border-radius: 3px; }
-.bc-root:hover { color: #ccc; background: #222; }
-.bc-sep { font-size: 11px; color: #2a2a2a; margin: 0 1px; user-select: none; }
+.picker-header::-webkit-scrollbar-thumb { background: #555; border-radius: 2px; }
+.bc-root { font-size: 11px; color: #888; cursor: pointer; padding: 2px 4px; border-radius: 3px; }
+.bc-root:hover { color: #ccc; background: #1a3530; }
+.bc-sep { font-size: 11px; color: #555; margin: 0 1px; user-select: none; }
 .bc-seg {
-  font-size: 11px; color: #666; cursor: pointer;
+  font-size: 11px; color: #999; cursor: pointer;
   padding: 2px 5px; border-radius: 3px; transition: background 0.1s, color 0.1s;
 }
-.bc-seg:hover { background: #222; color: #ccc; }
-.bc-seg.bc-current { color: #aaa; cursor: default; font-weight: 600; }
+.bc-seg:hover { background: #1a3530; color: #ccc; }
+.bc-seg.bc-current { color: #ccc; cursor: default; font-weight: 600; }
 .bc-seg.bc-current:hover { background: transparent; }
 
 .picker-list { flex: 1; overflow-y: auto; min-height: 0; }
 .picker-item {
   display: flex; align-items: center; gap: 10px;
   padding: 9px 16px; font-size: 12px; cursor: pointer;
-  border-bottom: 1px solid #1a1a1a; transition: background 0.1s; color: #ccc;
+  border-bottom: 1px solid #102018; transition: background 0.1s; color: #ccc;
 }
-.picker-item:hover { background: #1e1e2a; }
+.picker-item:hover { background: #1a3530; }
 .picker-item:last-child { border-bottom: none; }
 .pi-icon { font-size: 13px; flex-shrink: 0; opacity: 0.8; }
-.pi-arrow { font-size: 11px; color: #555; flex-shrink: 0; width: 13px; text-align: center; }
+.pi-arrow { font-size: 11px; color: #888; flex-shrink: 0; width: 13px; text-align: center; }
 .pi-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.picker-parent .pi-name { color: #555; font-style: italic; }
-.picker-empty { padding: 24px 16px; font-size: 11px; color: #444; text-align: center; }
-.picker-loading { padding: 24px 16px; font-size: 11px; color: #444; text-align: center; }
+.picker-parent .pi-name { color: #888; font-style: italic; }
+.picker-empty { padding: 24px 16px; font-size: 11px; color: #777; text-align: center; }
+.picker-loading { padding: 24px 16px; font-size: 11px; color: #777; text-align: center; }
 
 .picker-footer {
-  background: #111; border-top: 1px solid #222;
+  background: #0d1f1b; border-top: 1px solid #1e3d36;
   padding: 10px 14px; display: flex; align-items: center;
   justify-content: space-between; flex-shrink: 0; gap: 8px;
 }
-.picker-info { font-size: 10px; color: #444; flex: 1; }
+.picker-info { font-size: 10px; color: #777; flex: 1; }
 .picker-btns { display: flex; gap: 8px; }
 .btn-cancel {
-  background: transparent; border: 1px solid #2a2a2a; color: #666;
+  background: transparent; border: 1px solid #1e3d36; color: #999;
   font-family: inherit; font-size: 11px; padding: 6px 14px;
   border-radius: 4px; cursor: pointer; transition: border-color 0.15s, color 0.15s;
 }
-.btn-cancel:hover { border-color: #444; color: #aaa; }
+.btn-cancel:hover { border-color: #666; color: #ccc; }
 .btn-select {
-  background: #534AB7; border: none; color: #fff;
+  background: #006B58; border: none; color: #fff;
   font-family: inherit; font-size: 11px; font-weight: 600;
   padding: 6px 14px; border-radius: 4px; cursor: pointer; transition: background 0.15s;
 }
-.btn-select:hover { background: #6259c9; }
+.btn-select:hover { background: #007D68; }
 
 ::-webkit-scrollbar { width: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: #252525; border-radius: 2px; }
+::-webkit-scrollbar-thumb { background: #1e3d36; border-radius: 2px; }
 </style>
 </head>
 <body>
@@ -215,20 +190,6 @@ label {
         spellcheck="false" autocomplete="off" />
       <button class="browse-btn" onclick="openPicker()">Browse&hellip;</button>
     </div>
-
-    <hr class="divider">
-
-    <label for="apikey">
-      Anthropic API key
-      <span class="badge">ephemeral</span>
-    </label>
-    <input class="apikey-input" id="apikey" type="password"
-      placeholder="sk-ant-&hellip; (or set ANTHROPIC_API_KEY env var)"
-      autocomplete="new-password" />
-    <p class="hint">
-      Used only for AI analysis. Held in memory for this session only&nbsp;&mdash;
-      never written to disk, logs, or any response body.
-    </p>
 
     <button class="start-btn" id="btn" onclick="go()">Start Analysis</button>
     <p class="error" id="err"></p>
@@ -253,16 +214,15 @@ label {
 </div>
 
 <script>
-// Pre-fill from CLI arg
+// __PREFILL__ is replaced server-side with json.dumps(_prefill)
 const prefill = __PREFILL__;
 if (prefill) {
   document.getElementById('folder').value = prefill;
-  document.getElementById('apikey').focus();
+  document.getElementById('btn').focus();
 } else {
   document.getElementById('folder').focus();
 }
 
-// Enter submits the form when the picker is closed
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') closePicker();
   if (e.key === 'Enter' && document.getElementById('picker-modal').style.display === 'none') go();
@@ -271,7 +231,6 @@ document.addEventListener('keydown', e => {
 // ── Form submission ───────────────────────────────────────────────────────────
 async function go() {
   const folder = document.getElementById('folder').value.trim();
-  const apikey = document.getElementById('apikey').value;
   const btn    = document.getElementById('btn');
   const err    = document.getElementById('err');
 
@@ -285,7 +244,7 @@ async function go() {
     const res  = await fetch('/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ folder, api_key: apikey }),
+      body: JSON.stringify({ folder }),
     });
     const data = await res.json();
     if (!res.ok) {
@@ -323,7 +282,7 @@ function overlayClick(e) {
 function selectCurrent() {
   document.getElementById('folder').value = pickerPath;
   closePicker();
-  document.getElementById('apikey').focus();
+  document.getElementById('btn').focus();
 }
 
 async function loadDir(path) {
@@ -434,30 +393,30 @@ _GRAPH_HTML = """<!DOCTYPE html>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
-  background: #111; color: #e0e0e0;
+  background: #0d1f1b; color: #e0e0e0;
   font-family: 'Menlo','Monaco','Consolas',monospace;
   overflow: hidden; height: 100vh; display: flex; flex-direction: column;
 }
 
 /* ── Header ── */
 #hdr {
-  height: 46px; background: #181818; border-bottom: 1px solid #222;
+  height: 46px; background: #152e28; border-bottom: 1px solid #1e3d36;
   display: flex; align-items: center; padding: 0 18px; gap: 14px; flex-shrink: 0;
 }
 #hdr h1 { font-size: 14px; font-weight: 600; color: #fff; white-space: nowrap; }
 #status {
-  font-size: 11px; color: #666; flex: 1;
+  font-size: 11px; color: #999; flex: 1;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 #badge {
   padding: 2px 10px; border-radius: 9px; font-size: 10px; font-weight: 700;
-  letter-spacing: 0.6px; background: #222; color: #444;
+  letter-spacing: 0.6px; background: #152e28; color: #888;
   transition: background 0.35s, color 0.35s; white-space: nowrap;
 }
 
 /* ── Progress bar ── */
-#prog { height: 2px; background: #181818; flex-shrink: 0; }
-#prog-fill { height: 2px; background: #534AB7; width: 0%; transition: width 0.3s ease; }
+#prog { height: 2px; background: #152e28; flex-shrink: 0; }
+#prog-fill { height: 2px; background: #006B58; width: 0%; transition: width 0.3s ease; }
 
 /* ── Main layout ── */
 #main { flex: 1; display: flex; min-height: 0; }
@@ -467,101 +426,183 @@ body {
 /* ── Sidebar ── */
 #side {
   width: 355px; flex-shrink: 0; display: flex; flex-direction: column;
-  border-left: 1px solid #1d1d1d; background: #131313;
+  border-left: 1px solid #152e28; background: #111c19;
 }
 #log { flex: 1; overflow-y: auto; padding: 8px 10px; min-height: 0; }
-.le { font-size: 10.5px; color: #444; margin-bottom: 2px; line-height: 1.45; }
-.le.hl { color: #bbb; }
-.le.hl::before { content: '\25B8 '; color: #534AB7; }
+.le { font-size: 10.5px; color: #777; margin-bottom: 2px; line-height: 1.45; }
+.le.hl { color: #ccc; }
+.le.hl::before { content: '\25B8 '; color: #006B58; }
 
 /* ── Agent panel ── */
 #ap {
-  flex: 0 0 48%; border-top: 1px solid #1d1d1d;
+  flex: 0 0 48%; border-top: 1px solid #152e28;
   display: flex; flex-direction: column; min-height: 0;
 }
 #ap-hdr {
   padding: 8px 10px 5px; font-size: 10px; font-weight: 700;
-  letter-spacing: 0.8px; color: #534AB7; text-transform: uppercase; flex-shrink: 0;
+  letter-spacing: 0.8px; color: #006B58; text-transform: uppercase; flex-shrink: 0;
 }
 #ao {
   flex: 1; overflow-y: auto; padding: 0 10px 10px;
-  font-size: 11px; line-height: 1.65; color: #888; min-height: 0;
+  font-size: 11px; line-height: 1.65; color: #aaa; min-height: 0;
 }
-#ao h1 { font-size: 13px; color: #bbb; margin: 10px 0 5px; }
-#ao h2 { font-size: 12px; color: #aaa; margin: 10px 0 5px; }
-#ao h3 { font-size: 11px; color: #888; margin: 8px 0 4px; }
-#ao p { margin-bottom: 5px; color: #888; }
-#ao strong { color: #ccc; }
-#ao em { color: #999; }
+#ao h1 { font-size: 13px; color: #ddd; margin: 10px 0 5px; }
+#ao h2 { font-size: 12px; color: #ccc; margin: 10px 0 5px; }
+#ao h3 { font-size: 11px; color: #bbb; margin: 8px 0 4px; }
+#ao p { margin-bottom: 5px; color: #aaa; }
+#ao strong { color: #e0e0e0; }
+#ao em { color: #bbb; }
 #ao ul, #ao ol { padding-left: 15px; margin-bottom: 5px; }
 #ao li { margin-bottom: 2px; }
 #ao table { border-collapse: collapse; font-size: 10px; margin: 6px 0; width: 100%; }
-#ao td, #ao th { border: 1px solid #222; padding: 3px 7px; text-align: left; }
-#ao th { background: #1a1a1a; color: #666; }
-#ao code { background: #1a1a1a; padding: 1px 4px; border-radius: 2px; font-size: 10px; color: #8ab4f8; }
-#ao pre { background: #1a1a1a; padding: 8px; border-radius: 3px; margin: 5px 0; overflow-x: auto; }
+#ao td, #ao th { border: 1px solid #1e3d36; padding: 3px 7px; text-align: left; }
+#ao th { background: #132420; color: #999; }
+#ao code { background: #132420; padding: 1px 4px; border-radius: 2px; font-size: 10px; color: #8ab4f8; }
+#ao pre { background: #132420; padding: 8px; border-radius: 3px; margin: 5px 0; overflow-x: auto; }
 #ao pre code { background: none; padding: 0; }
-#ao hr { border: none; border-top: 1px solid #1e1e1e; margin: 8px 0; }
-#ao blockquote { border-left: 2px solid #333; padding-left: 8px; color: #666; }
+#ao hr { border: none; border-top: 1px solid #1a3530; margin: 8px 0; }
+#ao blockquote { border-left: 2px solid #555; padding-left: 8px; color: #999; }
 
 /* ── Stats bar ── */
 #stats {
-  height: 22px; background: #0d0d0d; border-top: 1px solid #1a1a1a;
+  height: 22px; background: #091512; border-top: 1px solid #152e28;
   display: flex; align-items: center; padding: 0 14px; gap: 18px; flex-shrink: 0;
 }
-.st { font-size: 10px; color: #333; }
-.st b { color: #666; }
+.st { font-size: 10px; color: #666; }
+.st b { color: #999; }
 
 /* ── Scrollbar ── */
 ::-webkit-scrollbar { width: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: #252525; border-radius: 2px; }
-::-webkit-scrollbar-thumb:hover { background: #333; }
+::-webkit-scrollbar-thumb { background: #1e3d36; border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: #555; }
 
 /* ── Save plan modal ── */
 .modal-overlay {
-  position: fixed; inset: 0; background: rgba(0,0,0,0.65);
+  position: fixed; inset: 0; background: rgba(0,0,0,0.5);
   display: flex; align-items: center; justify-content: center; z-index: 100;
 }
 .save-card {
-  width: 420px; background: #181818; border: 1px solid #2a2a2a;
+  width: 420px; background: #152e28; border: 1px solid #1e3d36;
   border-radius: 7px; overflow: hidden;
-  box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+  box-shadow: 0 20px 60px rgba(0,0,0,0.4);
 }
 .save-hdr {
-  background: #111; border-bottom: 1px solid #222;
+  background: #0d1f1b; border-bottom: 1px solid #1e3d36;
   padding: 12px 16px; font-size: 12px; font-weight: 600; color: #ccc;
 }
 .save-body { padding: 16px; }
 .save-lbl {
-  display: block; font-size: 10px; color: #555; font-weight: 700;
+  display: block; font-size: 10px; color: #888; font-weight: 700;
   letter-spacing: 0.6px; text-transform: uppercase; margin-bottom: 6px;
 }
 .save-input {
-  display: block; width: 100%; background: #0e0e0e;
-  border: 1px solid #252525; color: #e0e0e0;
+  display: block; width: 100%; background: #091512;
+  border: 1px solid #1e3d36; color: #e0e0e0;
   font-family: inherit; font-size: 12px;
   padding: 9px 11px; border-radius: 4px; outline: none;
   transition: border-color 0.2s;
 }
-.save-input:focus { border-color: #534AB7; }
+.save-input:focus { border-color: #006B58; }
 .save-err { font-size: 11px; color: #cc4444; margin-top: 8px; min-height: 16px; }
 .save-footer {
-  background: #111; border-top: 1px solid #222;
+  background: #0d1f1b; border-top: 1px solid #1e3d36;
   padding: 10px 14px; display: flex; justify-content: flex-end; gap: 8px;
 }
 .btn-cancel {
-  background: transparent; border: 1px solid #2a2a2a; color: #666;
+  background: transparent; border: 1px solid #1e3d36; color: #999;
   font-family: inherit; font-size: 11px; padding: 6px 14px;
   border-radius: 4px; cursor: pointer; transition: border-color 0.15s, color 0.15s;
 }
-.btn-cancel:hover { border-color: #444; color: #aaa; }
+.btn-cancel:hover { border-color: #666; color: #ccc; }
 .btn-select {
-  background: #534AB7; border: none; color: #fff;
+  background: #006B58; border: none; color: #fff;
   font-family: inherit; font-size: 11px; font-weight: 600;
   padding: 6px 14px; border-radius: 4px; cursor: pointer; transition: background 0.15s;
 }
-.btn-select:hover { background: #6259c9; }
+.btn-select:hover { background: #007D68; }
+
+/* ── Presentation overlay ── */
+#present-overlay {
+  position: fixed; inset: 0; background: #091512; z-index: 200;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+#present-hdr {
+  height: 56px; background: #0d1f1b; border-bottom: 1px solid #1e3d36;
+  display: flex; align-items: center; padding: 0 32px; gap: 16px; flex-shrink: 0;
+}
+#present-hdr-title {
+  font-size: 15px; font-weight: 600; color: #fff; flex: 1;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+.present-save-btn {
+  background: #2a4a2a; border: 1px solid #406040; color: #5aa05a;
+  font-family: inherit; font-size: 11px; font-weight: 600; padding: 6px 16px;
+  border-radius: 4px; cursor: pointer; transition: background 0.15s, color 0.15s;
+  letter-spacing: 0.3px; margin-right: 6px;
+}
+.present-save-btn:hover { background: #335033; color: #7acc7a; }
+.present-close-btn {
+  background: transparent; border: 1px solid #1e3d36; color: #aaa;
+  font-family: inherit; font-size: 11px; padding: 6px 16px;
+  border-radius: 4px; cursor: pointer; transition: border-color 0.15s, color 0.15s;
+  letter-spacing: 0.3px;
+}
+.present-close-btn:hover { border-color: #666; color: #fff; }
+#present-scroll {
+  flex: 1; overflow-y: auto; display: flex; flex-direction: column; align-items: center;
+  padding: 56px 48px 80px;
+}
+#present-content {
+  width: 100%; max-width: 860px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-size: 16px; line-height: 1.75; color: #bbb;
+}
+#present-content h1 {
+  font-size: 30px; color: #fff; margin: 0 0 28px; font-weight: 700; line-height: 1.2;
+}
+#present-content h2 {
+  font-size: 20px; color: #4a9e8e; font-weight: 600;
+  margin: 44px 0 14px; padding-bottom: 10px; border-bottom: 1px solid #152e28;
+}
+#present-content h3 {
+  font-size: 16px; color: #ccc; font-weight: 600; margin: 24px 0 8px;
+}
+#present-content p { margin-bottom: 14px; }
+#present-content strong { color: #e0e0e0; }
+#present-content em { color: #aaa; }
+#present-content ul, #present-content ol { padding-left: 26px; margin-bottom: 14px; }
+#present-content li { margin-bottom: 7px; }
+#present-content code {
+  background: #132420; padding: 2px 7px; border-radius: 3px;
+  font-family: 'Menlo','Monaco','Consolas',monospace; font-size: 14px; color: #8ab4f8;
+}
+#present-content pre {
+  background: #091512; padding: 18px 22px; border-radius: 6px;
+  margin: 14px 0; overflow-x: auto; border: 1px solid #152e28;
+}
+#present-content pre code { background: none; padding: 0; font-size: 13px; }
+#present-content table { border-collapse: collapse; width: 100%; margin: 18px 0; }
+#present-content td, #present-content th { border: 1px solid #152e28; padding: 10px 16px; }
+#present-content th {
+  background: #0d1f1b; color: #888; font-size: 11px;
+  letter-spacing: 0.6px; text-transform: uppercase; font-weight: 700;
+}
+#present-content hr { border: none; border-top: 1px solid #102018; margin: 36px 0; }
+#present-content blockquote {
+  border-left: 3px solid #006B58; padding: 2px 0 2px 18px;
+  margin: 14px 0; color: #999; font-style: italic;
+}
+
+/* Present Plan button in header */
+#present-btn {
+  display: none; background: #006B58; border: none; color: #fff;
+  font-family: inherit; font-size: 11px; font-weight: 600;
+  padding: 6px 14px; border-radius: 4px; cursor: pointer;
+  letter-spacing: 0.3px; transition: background 0.15s; white-space: nowrap;
+}
+#present-btn:hover { background: #007D68; }
+#present-btn.ready { display: block; }
 </style>
 </head>
 <body>
@@ -570,6 +611,7 @@ body {
   <h1>Seam</h1>
   <div id="status">Connecting to analysis server&hellip;</div>
   <div id="badge">IDLE</div>
+  <button id="present-btn" onclick="openPresentMode()">&#x2B21; Present Plan</button>
 </div>
 <div id="prog"><div id="prog-fill"></div></div>
 
@@ -610,21 +652,33 @@ body {
   </div>
 </div>
 
+<!-- Presentation overlay -->
+<div id="present-overlay" style="display:none">
+  <div id="present-hdr">
+    <span id="present-hdr-title">&#x2B21; Migration Plan</span>
+    <button class="present-save-btn" onclick="openSaveFromPresent()">&#x2193;&nbsp; Save</button>
+    <button class="present-close-btn" onclick="closePresentMode()">&#x2715;&nbsp; Close</button>
+  </div>
+  <div id="present-scroll">
+    <div id="present-content"></div>
+  </div>
+</div>
+
 <script>
 marked.setOptions({ breaks: true, gfm: true });
 
 const PALETTE = [
-  "#534AB7","#D85A30","#0F6E56","#BA7517",
+  "#006B58","#D85A30","#0F6E56","#BA7517",
   "#993556","#185FA5","#639922","#A32D2D"
 ];
 const DCLR = {
-  user:"#534AB7", order:"#D85A30", payment:"#0F6E56", inventory:"#BA7517",
+  user:"#006B58", order:"#D85A30", payment:"#0F6E56", inventory:"#BA7517",
   notification:"#993556", reporting:"#185FA5",
-  shared:"#4a4a4a", database:"#2a2a2a", unknown:"#2e2e2e"
+  shared:"#666", database:"#1e3d36", unknown:"#555"
 };
 const STAGE_CLR = {
   parsing:"#BA7517", clustering:"#993556", metrics:"#185FA5",
-  agent:"#534AB7", complete:"#0F6E56"
+  agent:"#006B58", complete:"#0F6E56"
 };
 
 // ── vis.js setup ─────────────────────────────────────────────────────────────
@@ -679,7 +733,7 @@ es.onmessage = ({ data }) => {
     case 'stage': {
       const b = document.getElementById('badge');
       b.textContent = m.stage.toUpperCase();
-      b.style.background = STAGE_CLR[m.stage] || '#222';
+      b.style.background = STAGE_CLR[m.stage] || '#091512';
       b.style.color = '#fff';
       break;
     }
@@ -701,7 +755,7 @@ es.onmessage = ({ data }) => {
     }
 
     case 'add_node': {
-      const c = DCLR[m.domain] || '#2e2e2e';
+      const c = DCLR[m.domain] || '#132420';
       nodesDS.add({
         id: m.id, label: m.label,
         color: {
@@ -725,9 +779,9 @@ es.onmessage = ({ data }) => {
         edgesDS.add({
           id: key, from: m.from, to: m.to, title: m.relationship,
           color: {
-            color:     isTable ? '#4a1a1a' : '#222',
-            hover:     '#555',
-            highlight: '#888',
+            color:     isTable ? '#6a2a2a' : '#1e3d36',
+            hover:     '#666',
+            highlight: '#999',
           },
           width:  m.relationship === 'instantiates' ? 1.5 : 0.8,
           dashes: isTable ? [3, 3] : false,
@@ -776,7 +830,7 @@ es.onmessage = ({ data }) => {
       try {
         edgesDS.update({
           id: key,
-          color: { color: '#6e1414', hover: '#c44', highlight: '#f44' },
+          color: { color: '#8e2424', hover: '#c44', highlight: '#f44' },
           width: 1.8, dashes: [5, 4],
         });
       } catch (_) {}
@@ -792,10 +846,12 @@ es.onmessage = ({ data }) => {
       document.getElementById('ao').innerHTML = marked.parse(agentBuf);
       document.getElementById('ap').scrollTop =
         document.getElementById('ap').scrollHeight;
+      document.getElementById('present-btn').classList.add('ready');
       break;
 
     case 'plan_ready':
-      openSaveModal(m.default_dir || '');
+      pendingDefaultDir = m.default_dir || '';
+      openPresentMode();
       break;
 
     case 'complete':
@@ -877,6 +933,37 @@ es.onerror = () => {
   b.style.background = '#4a1414';
   b.style.color = '#ff6b6b';
 };
+
+// ── Presentation mode ────────────────────────────────────────────────────────
+let pendingDefaultDir = '';
+
+function openPresentMode() {
+  if (!agentBuf) return;
+  document.getElementById('present-content').innerHTML = marked.parse(agentBuf);
+  document.getElementById('present-scroll').scrollTop = 0;
+  document.getElementById('present-overlay').style.display = 'flex';
+}
+
+function closePresentMode() {
+  document.getElementById('present-overlay').style.display = 'none';
+}
+
+function openSaveFromPresent() {
+  closePresentMode();
+  openSaveModal(pendingDefaultDir);
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && document.getElementById('present-overlay').style.display !== 'none') {
+    closePresentMode();
+  }
+  if ((e.key === 'p' || e.key === 'P') &&
+      document.getElementById('save-modal').style.display === 'none' &&
+      document.getElementById('present-overlay').style.display === 'none' &&
+      document.activeElement.tagName !== 'INPUT') {
+    openPresentMode();
+  }
+});
 </script>
 </body>
 </html>"""
@@ -885,7 +972,7 @@ es.onerror = () => {
 # ── SSE helpers ───────────────────────────────────────────────────────────────
 
 def emit(msg: dict):
-    """Push a JSON message to every connected SSE client (thread-safe)."""
+    """Thread-safe SSE broadcast."""
     data = json.dumps(msg)
     with _lock:
         dead = []
@@ -921,7 +1008,6 @@ def _sse_stream():
 
 @app.route('/browse')
 def browse():
-    """Return a JSON directory listing for the folder picker."""
     raw = (request.args.get('path') or '').strip()
     p   = Path(raw).expanduser().resolve() if raw else Path.home()
     if not p.is_dir():
@@ -953,14 +1039,13 @@ def graph():
 
 @app.route('/start', methods=['POST'])
 def start():
-    global _pending_folder, _pending_api_key
+    global _pending_folder
 
     if _start_event.is_set():
         return jsonify({"error": "Analysis already started."}), 400
 
     data       = request.get_json(silent=True) or {}
     folder_raw = (data.get('folder') or '').strip()
-    api_key    = (data.get('api_key') or '').strip() or None
 
     if not folder_raw:
         return jsonify({"error": "Folder path is required."}), 400
@@ -973,8 +1058,7 @@ def start():
     if not java_files:
         return jsonify({"error": f"No .java files found in: {folder_raw}"}), 400
 
-    _pending_folder  = str(p)
-    _pending_api_key = api_key
+    _pending_folder = str(p)
     _start_event.set()
 
     return jsonify({"ok": True, "files": len(java_files)})
@@ -1016,28 +1100,17 @@ def events():
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
 
-def wait_for_config() -> tuple[str, str | None]:
-    """
-    Block until the user submits the setup form.
-    Returns (folder_path, api_key). The api_key is cleared from memory
-    immediately after being returned.
-    """
-    global _pending_api_key
+def wait_for_config() -> str:
     _start_event.wait()
-    folder  = _pending_folder
-    api_key = _pending_api_key
-    _pending_api_key = None  # clear from memory
-    return folder, api_key
+    return _pending_folder
 
 
 def set_pending_plan(text: str):
-    """Store the completed migration plan so /save_plan can write it."""
     global _pending_plan
     _pending_plan = text
 
 
 def start_server(port: int = 5050, prefill: str = ""):
-    """Start Flask in a background daemon thread and open the browser."""
     global _prefill
     _prefill = prefill
 

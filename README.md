@@ -13,11 +13,23 @@ No cloud infrastructure required. Everything runs on your machine.
 3. **Detects communities** — runs the Louvain algorithm on the graph to surface cohesive groups of classes that are natural microservice boundaries.
 4. **Scores extraction risk** — betweenness centrality, in/out degree, and cross-cluster edge count for every class.
 5. **Visualises** — produces an interactive force-directed HTML graph you can open in any browser.
-6. **Plans the migration** — a Claude agent reads the analysis report and streams a structured four-section plan: named microservices, strangler-fig steps, edge-by-edge API classification, and architectural risks.
+6. **Plans the migration** — a Claude agent reads the analysis report and streams a structured five-section plan: codebase overview, named microservices, strangler-fig steps, edge-by-edge API classification, and architectural risks.
 
 ---
 
 ## Modes
+
+### Live mode (default)
+
+Streams the analysis in real time to a browser UI.
+
+```bash
+cd analyser
+python main.py                               # enter the repo path in the browser
+python main.py ../path/to/your/java-repo     # pre-fills the path field
+```
+
+Opens `http://localhost:5050` with a setup page. Enter the repo path and your Anthropic API key, then click **Start Analysis**. The graph builds file-by-file; communities are coloured as they are detected; the Claude agent streams its plan into the right-hand panel. When the agent finishes, a **Save Migration Plan** modal appears in the browser.
 
 ### Batch mode
 
@@ -25,24 +37,12 @@ Runs the full pipeline end-to-end and exits.
 
 ```bash
 cd analyser
-python main.py ../path/to/your/java-repo
+python main.py ../path/to/your/java-repo --batch
 ```
 
 Outputs written alongside the repo:
 - `graph.html` — interactive dependency graph
 - `report.json` — structured analysis: communities, metrics, cross-cluster edges, extraction order
-
-### Live mode
-
-Streams the analysis in real time to a browser UI.
-
-```bash
-cd analyser
-python main.py --live                        # enter the repo path in the browser
-python main.py ../path/to/your/java-repo --live   # pre-fills the path field
-```
-
-Opens `http://localhost:5050` with a setup page. Enter the repo path and your Anthropic API key, then click **Start Analysis**. The graph builds file-by-file; communities are coloured as they are detected; the Claude agent streams its plan into the right-hand panel. When the agent finishes, a **Save Migration Plan** modal appears in the browser.
 
 ### Agent-only mode
 
@@ -103,7 +103,7 @@ analyser/
 | Cross-cluster edges | `build_graph.py` | Edges that cross community boundaries = future API surface |
 | Rank | `main.py` | Order communities by external edges + avg betweenness |
 | Visualise | `visualise.py` | PyVis force-directed graph → self-contained HTML |
-| Agent | `agent.py` | Claude streams four-section migration plan |
+| Agent | `agent.py` | Claude streams five-section migration plan |
 
 ### Live mode architecture
 
@@ -152,6 +152,7 @@ Structured JSON with five top-level keys:
 ### `migration_plan.md`
 
 The Claude agent's output saved as markdown. Contains:
+0. **Codebase Overview** — plain-language architectural summary for first-time readers
 1. **Proposed Microservices** — named service per community, purpose, key classes, extraction difficulty (LOW / MEDIUM / HIGH)
 2. **Strangler Fig Migration Plan** — ordered numbered steps with rationale
 3. **Cross-Cluster Edge Classification** — table mapping each coupling point to REST API / async event / shared library

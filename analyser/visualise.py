@@ -1,21 +1,9 @@
-"""
-visualise.py — Interactive graph renderer using PyVis.
-
-Produces a self-contained HTML file with a vis.js force-directed graph.
-Visual encoding:
-  - Node colour   → Louvain community (candidate microservice boundary)
-  - Node size     → total degree × 3 + 14 baseline; highly-connected classes
-                    appear larger and are immediately visible as coupling hotspots
-  - Diamond shape → DB table nodes (distinct from class nodes)
-  - Red edges     → accesses_table relationships (shared data = tight coupling)
-  - Grey edges    → imports / instantiates relationships
-"""
+"""Node colour = community, size = total degree, diamond = DB table, red edges = accesses_table."""
 
 import json
 from pyvis.network import Network
 
 
-# Community palette — up to 8 distinct clusters before cycling
 COMMUNITY_PALETTE = [
     "#534AB7", "#D85A30", "#0F6E56", "#BA7517",
     "#993556", "#185FA5", "#639922", "#A32D2D",
@@ -23,15 +11,6 @@ COMMUNITY_PALETTE = [
 
 
 def render_graph(G, partition: dict, metrics: dict, output_path: str):
-    """
-    Render *G* to an interactive HTML file at *output_path*.
-
-    Args:
-        G:           NetworkX DiGraph produced by build_graph.
-        partition:   Node → community-id mapping from run_clustering.
-        metrics:     Node → {betweenness, in_degree, out_degree, total_degree}.
-        output_path: Destination path for the .html file.
-    """
     net = Network(height="700px", width="100%", bgcolor="#1a1a1a",
                   font_color="white", directed=True)
     net.barnes_hut(gravity=-8000, central_gravity=0.3, spring_length=120)

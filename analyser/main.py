@@ -1,28 +1,29 @@
 """
-main.py — Seam pipeline orchestrator.
-
-Two entry points:
-
-  Batch mode  (default)
-    Runs the full analysis pipeline sequentially, writes graph.html and
-    report.json next to the target repo, then exits.
-
-  Live mode   (--live flag)
-    Starts a Flask server on port 5050, opens a browser setup page, then
-    runs the same pipeline one file at a time while streaming graph updates
-    to the browser via Server-Sent Events.  The Claude agent streams its
-    migration plan token-by-token into the right-hand panel.
-
 Usage:
-    python main.py <path-to-java-repo>
-    python main.py <path-to-java-repo> --live
-    python main.py --live                       # enter path in the browser
+    python main.py                              # live mode, enter path in browser
+    python main.py <path-to-java-repo>          # live mode, pre-fills folder field
+    python main.py <path-to-java-repo> --batch  # headless batch run
 """
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
+
+
+def _load_env_file():
+    env_path = Path(__file__).resolve().parent.parent / '.env'
+    if not env_path.exists():
+        return
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        key, _, val = line.partition('=')
+        os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+
+_load_env_file()
 
 from parse_java import get_all_classes, parse_file, parse_repo
 from build_graph import (
@@ -133,21 +134,12 @@ def main(repo_path: str):
 # ── Live mode ─────────────────────────────────────────────────────────────────
 
 def main_live(repo_path: str = None):
-    """
-    Live-streaming pipeline.
-
-    Runs the same stages as batch mode but processes one file at a time,
-    emitting SSE events to the browser after each step so the graph builds
-    visually in real time.  The Claude agent streams its plan word-by-word
-    into the right-hand panel; when it finishes, a save-plan modal appears
-    in the browser.
-    """
     from live_server import emit, start_server, wait_for_config
 
     print(f"\n{'='*60}\n  Seam  [live mode]\n{'='*60}")
     start_server(prefill=repo_path or "")
 
-    folder, api_key = wait_for_config()
+    folder = wait_for_config()
     repo       = Path(folder).resolve()
     java_files = list(repo.rglob("*.java"))
 
@@ -202,7 +194,7 @@ def main_live(repo_path: str = None):
 
         emit({"type": "file_parsed", "file": jf.name})
         emit({"type": "log", "message": f"Parsed {jf.name} ({len(file_edges)} edges)"})
-        time.sleep(4)
+        time.sleep(2)
 
     emit({"type": "log", "message": f"Parse complete — {len(all_edges)} raw edges",
           "highlight": True})
@@ -275,7 +267,6 @@ def main_live(repo_path: str = None):
         plan = run_agent(
             report_path,
             lambda chunk: emit({"type": "agent_chunk", "text": chunk}),
-            api_key=api_key,
         )
         emit({"type": "log", "message": "Agent analysis complete", "highlight": True})
         set_pending_plan(plan)
@@ -302,17 +293,7 @@ def main_live(repo_path: str = None):
 # ── Shared helpers ────────────────────────────────────────────────────────────
 
 def rank_extraction_order(communities: dict, metrics: dict, G, classes: list) -> list:
-    """
-    Rank communities from safest to riskiest to extract.
-
-    Scoring heuristic (ascending = safer first):
-      primary   — external_edges: fewer cross-boundary edges means fewer contracts
-                  to define before the service can stand alone.
-      secondary — avg_betweenness: communities whose members are architectural
-                  bridges carry higher co-change risk even at equal edge counts.
-
-    Risk bands: LOW ≤ 2 external edges, MEDIUM ≤ 5, HIGH > 5.
-    """
+    """Sort by (external_edges, avg_betweenness) — fewer cross-boundary edges = safer to extract first. Risk: LOW ≤ 2, MEDIUM ≤ 5, HIGH > 5."""
     class_to_domain = {c["name"]: c["domain"] for c in classes}
     results = []
 
@@ -348,11 +329,10 @@ if __name__ == "__main__":
     positional = [a for a in sys.argv[1:] if not a.startswith("--")]
     flags      = {a for a in sys.argv[1:] if a.startswith("--")}
 
-    if "--live" in flags:
-        main_live(positional[0] if positional else None)
-    elif not positional:
-        print("Usage: python main.py <path-to-java-repo> [--live]")
-        print("  --live    stream live graph visualisation in browser")
-        sys.exit(1)
-    else:
+    if "--batch" in flags:
+        if not positional:
+            print("Usage: python main.py <path-to-java-repo> --batch")
+            sys.exit(1)
         main(positional[0])
+    else:
+        main_live(positional[0] if positional else None)
